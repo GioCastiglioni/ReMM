@@ -160,15 +160,18 @@ class So2SatDataModule(LightningDataModule):
                           normalizers=self.normalizers)
             self.train_dataset = So2SatMMSSL(split="train", **common)
             self.val_dataset = So2SatMMSSL(split="validation", **common)
+            self.test_dataset = So2SatMMSSL(split="test", **common)
         elif self.model == "Sup":
             common = dict(root=self.root, image_size=self.image_size,
                           normalizers=self.normalizers)
             self.train_dataset = So2SatSup(split="train",
                                            spatial_transform=self.spatial_augment, **common)
+            # The linear probe selects its cost on validation and refits on train and
+            # validation together, so the reported split must be a third one.
             self.val_dataset = So2SatSup(split="validation", **common)
+            self.test_dataset = So2SatSup(split="test", **common)
         else:
             raise ValueError(f"Unknown model: {self.model}")
-        self.test_dataset = self.val_dataset
 
     def _loader(self, dataset, shuffle):
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle,
