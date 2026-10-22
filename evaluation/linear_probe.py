@@ -38,6 +38,7 @@ class LinearProbingCallback(Callback):
                  always_prefix: bool = False,
                  every_n_epochs: int = 1,
                  split_label_columns: bool = False,
+                 early_stopping_patience: Optional[int] = None,
                  **extraction_kwargs):
         """
         :param downstream_data_modules: List of dataset to evaluate
@@ -56,6 +57,10 @@ class LinearProbingCallback(Callback):
             their inputs cost a single feature extraction. Labels and features come
             from the same pass, so the columns stay aligned under any shuffling.
             Unrelated to `multilabel`, which reports F1 on a multi-label target.
+        :param early_stopping_patience: if set, early-stop on the validation score of the
+            per-epoch probe (the score at the selected cost, before the refit on train and
+            validation): training stops after this many epochs without improvement, and the
+            test scores of the best epoch are logged with an `es_` prefix, with `es_epoch`.
         :param extraction_kwargs: Keyword arguments given to `extract_features` method
         """
         self.downstream_data_modules = downstream_data_modules
@@ -77,6 +82,8 @@ class LinearProbingCallback(Callback):
                 raise ValueError("`split_label_columns` expects exactly one data module, "
                                  f"got {len(downstream_data_modules)}.")
         self.logging_level = logging_level
+        self.early_stopping_patience = early_stopping_patience
+        self.best_val, self.best_epoch, self.best_scores, self.wait = None, None, {}, 0
         self.extraction_kwargs = extraction_kwargs
         if self.names is None:
             self.names = [d.test_dataloader().__class__.__name__ for d in downstream_data_modules]
@@ -110,7 +117,8 @@ class LinearProbingCallback(Callback):
                         evaluate_linear_probe(train_features, y_train, test_features,
                                               y_test, val_features, y_val,
                                               multilabel=self.multilabel, use_sklearn=self.use_sklearn,
-                                              fastsearch=self.fastsearch, logging_level=self.logging_level))
+                                              fastsearch=self.fastsearch, logging_level=self.logging_level,
+                                              return_val_score=self.early_stopping_patience is not None))
                     for k, v in scores_.items():
                         scores[k].append(v)
                     print('Linear probe ({d}): {scores}'
@@ -124,10 +132,29 @@ class LinearProbingCallback(Callback):
 
             if log:
                 pl_module.log_dict(dict(scores), on_epoch=True, sync_dist=True)
+            return scores
 
     def on_validation_epoch_end(self, trainer: Trainer, pl_module: LightningModule):
+        if self.early_stopping_patience is not None and trainer.sanity_checking:
+            return  # the sanity check would enter the untrained weights as an epoch
         if self.frequency == "by_epoch" and (trainer.current_epoch + 1) % self.every_n_epochs == 0:
-            self.linear_probing(trainer, pl_module)
+            scores = self.linear_probing(trainer, pl_module)
+            if self.early_stopping_patience is not None and scores is not None:
+                self.early_stop(trainer, pl_module, scores)
+
+    def early_stop(self, trainer: Trainer, pl_module: LightningModule, scores: dict):
+        """Keep the test scores of the epoch with the best validation score, and stop
+        once `early_stopping_patience` epochs have passed without improving it."""
+        val = scores["val_score"]
+        if self.best_val is None or val > self.best_val:
+            self.best_val, self.best_epoch, self.wait = val, trainer.current_epoch, 0
+            self.best_scores = {f"es_{k}": v for k, v in scores.items()}
+        else:
+            self.wait += 1
+            if self.wait >= self.early_stopping_patience:
+                trainer.should_stop = True
+        pl_module.log_dict({**self.best_scores, "es_epoch": float(self.best_epoch)},
+                           on_epoch=True, sync_dist=True)
 
     def on_fit_end(self, trainer: Trainer, pl_module: LightningModule):
         if self.frequency == "by_fit":
@@ -152,13 +179,16 @@ def evaluate_linear_probe(
     combine_trainval=True,
     use_sklearn=False,
     fastsearch=False,
-    logging_level="INFO"
+    logging_level="INFO",
+    return_val_score=False
 ):
     """
     Args:
         holdout_fraction: Fraction of the (official) train split to hold out for
             validation while searching the cost hyperparameter. Holding out will
             be deterministic and have similar class distribution as train split.
+        return_val_score: also return `val_score`, the validation score at the
+            selected cost (before the refit on train and validation).
     """
     start = time.time()
     logger = logging.getLogger("Linear probing")
@@ -191,6 +221,8 @@ def evaluate_linear_probe(
     )
     test_acc = test_linear_probe(classifier, test_feats, test_labels, use_mean_accuracy,
                                  use_sklearn=use_sklearn, multilabel=multilabel, logger=logger)
+    if return_val_score:
+        test_acc = {**test_acc, "val_score": float(classifier.val_score)}
 
     del classifier
     torch.cuda.empty_cache()
@@ -326,6 +358,7 @@ def train_linear_probe(
             train_feats, train_labels, best_cost, sk_verbose, max_iter, use_sklearn, multilabel
         )
 
+    final_classifier.val_score = float(best_accuracy)
     return final_classifier
 
 
