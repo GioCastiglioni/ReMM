@@ -27,6 +27,8 @@ class WoMMLoss(nn.Module):
     COMPOSITE_REGS = {
         'mix-sigreg-neg-samples': ('mix', 'sigreg', 'neg-samples'),
         'split-sigreg-neg-samples': ('split', 'sigreg', 'neg-samples'),
+        'mix-sigreg-neg-samples-cross': ('mix', 'sigreg', 'neg-samples-cross'),
+        'split-sigreg-neg-samples-cross': ('split', 'sigreg', 'neg-samples-cross'),
     }
     SEM_AWARE_MARGIN = 0.5
 
