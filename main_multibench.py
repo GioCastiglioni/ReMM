@@ -100,13 +100,19 @@ def main(cfg: DictConfig):
     # without it every callback would log the bare key `acc1` and overwrite the
     # others.
     probe_cfg = cfg.linear_probing_reg if dataset in REGRESSION_DATASETS else cfg.linear_probing
+    masks = modality_masks(len(modalities))
+    finetune = cfg.model.name == "SupervisedClassifier"
+    if finetune:
+        # Fine-tuning reports the joint representation, probed at every epoch for early
+        # stopping, so the unimodal probes would only triple that cost.
+        masks = dict(list(masks.items())[:1])
     callbacks = [instantiate(probe_cfg,
                              downstream_data_modules=[downstream_data_module],
                              names=[f"{dataset}_{m}"],
                              mask_modalities=[mask],
                              always_prefix=True,
                              _convert_="all")
-                 for m, mask in modality_masks(len(modalities)).items()]
+                 for m, mask in masks.items()]
 
     # Resuming: `ckpt_path` continues training from a finished run and `wandb_id`
     # keeps the curves in that run instead of opening a second one.
@@ -116,7 +122,7 @@ def main(cfg: DictConfig):
 
     # `group_suffix` marks an ablation of the pipeline itself, so its runs do not
     # land in the same cell as the reference ones when the results are harvested.
-    identity = build_run_identity(cfg, dataset=dataset, stage="pretrain",
+    identity = build_run_identity(cfg, dataset=dataset, stage="finetune" if finetune else "pretrain",
                                   extra={"n_modalities": len(modalities)},
                                   group_suffix=getattr(cfg, "group_suffix", None))
     run_name = identity.name
