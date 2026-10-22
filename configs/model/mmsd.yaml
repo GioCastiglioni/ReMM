@@ -43,3 +43,9 @@ model:
   predictor_kwargs: {}
 
   cross_view: null                 # null = each objective's own default
+  # true: the teacher also encodes the unimodal masks and the joint student predicts
+  # them, so each unimodal-joint pair runs in both directions as in CoMM
+  bidirectional: false
+  # false (with bidirectional: true) drops the unimodal student's predictions of the joint
+  # teacher, the direction a unimodal branch cannot satisfy
+  unimodal_to_joint: true

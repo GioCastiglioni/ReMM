@@ -17,7 +17,13 @@ class SupervisedClassifier(BaseModel):
     def __init__(self, ckpt_path: str,
                  num_classes: int,
                  optim_kwargs: Dict,
-                 model: str = "supcon"):
+                 model: str = "supcon",
+                 supcon_head: bool = True):
+        """
+        :param supcon_head: if True, SupCon acts on a projection head trained from scratch, with
+            the architecture of the pre-training head, as in Khosla et al.; the probes still read
+            the encoder output. False applies it to the encoder output itself, as CoMM's code does.
+        """
 
         super().__init__(optim_kwargs)
         assert model in {"supcon", "bce_with_logits", "mse"}
@@ -26,8 +32,17 @@ class SupervisedClassifier(BaseModel):
         self.base_encoder, embed_dim = self._parse_ckpt(self.ckpt_path)
         self.model = model
         self.metrics = dict()
+        self.head = None
         if self.model == "supcon":
             self.loss = SupConLoss()
+            if supcon_head:
+                # The pre-trained head is taken out of the encoder and re-initialised, so the
+                # fine-tuned model keeps the parameter count of the pre-trained one.
+                self.head = self.base_encoder.head
+                del self.base_encoder.head
+                for m in self.head.modules():
+                    if m is not self.head and hasattr(m, "reset_parameters"):
+                        m.reset_parameters()
         elif self.model == "bce_with_logits":
             self.loss = nn.BCEWithLogitsLoss()
             self.linear = nn.Linear(embed_dim, num_classes)
@@ -52,21 +67,25 @@ class SupervisedClassifier(BaseModel):
 
     def _parse_ckpt(self, pth: str):
         from hydra.utils import instantiate
-        ckpt = torch.load(pth)
-        hparams = ckpt["hyper_parameters"]
-        dataset = getattr(hparams["data"]["data_module"], "dataset", hparams["data"]["name"])
-        model_name = hparams["model"]["name"]
+        from omegaconf import OmegaConf
+        ckpt = torch.load(pth, map_location="cpu", weights_only=False)
+        # As a config, so that interpolations such as `${embed_dim}` in the saved
+        # encoders resolve against the run's own root.
+        hparams = OmegaConf.create(ckpt["hyper_parameters"])
+        dataset = hparams.data.data_module.get("dataset", hparams.data.name)
+        model_name = hparams.model.name
         kwargs = dict()
-        if model_name == "CoMM":
+        if model_name in ("CoMM", "WoMM"):
             encoders = instantiate(hparams[dataset]["encoders"])  # encoders specific to each dataset
             adapters = instantiate(hparams[dataset]["adapters"])  # adapters also specific
             kwargs["encoder"] = {
                 "encoders": encoders,
                 "input_adapters": adapters}
-            model = instantiate(hparams["model"]["model"], optim_kwargs=hparams["optim"], **kwargs)
-            embed_dim = hparams["model"]["model"]["encoder"]["embed_dim"]
-            out = model.load_state_dict(ckpt["state_dict"])
-            print(out)
+            model = instantiate(hparams.model.model, optim_kwargs=hparams.optim, **kwargs)
+            embed_dim = int(hparams.model.model.encoder.embed_dim)
+            if hasattr(model, "on_load_checkpoint"):
+                model.on_load_checkpoint(ckpt)  # WoMM restores the keys of frozen encoders
+            model.load_state_dict(ckpt["state_dict"], strict=True)
         else:
             raise NotImplementedError()
         return model, embed_dim
@@ -76,6 +95,8 @@ class SupervisedClassifier(BaseModel):
             X1, X2 = X
             embed1 = self.base_encoder.encoder(X1)
             embed2 = self.base_encoder.encoder(X2)
+            if self.head is not None:
+                embed1, embed2 = self.head(embed1), self.head(embed2)
             return embed1, embed2
         elif self.model in ["bce_with_logits", "mse"]:
             embed = self.base_encoder.encoder(X)

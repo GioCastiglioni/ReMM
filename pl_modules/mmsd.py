@@ -10,7 +10,9 @@ Read this as WoMM with two changes and nothing else:
 The pairs themselves are untouched: mask `m` of view 1 against the joint of view 2,
 mask `m` of view 2 against the joint of view 1, and joint against joint. That keeps
 the probes, the mask structure and the biased/unbiased arms directly comparable to
-the contrastive and variance families.
+the contrastive and variance families. With `bidirectional` the teacher also encodes
+the unimodal masks and each unimodal-joint pair is used in both roles, as CoMM's
+symmetric InfoNCE does.
 """
 import copy
 import math
@@ -40,7 +42,9 @@ class MMSD(BaseModel):
                  cross_view: Optional[bool] = None,
                  lr_warmup_frac: float = 0.1,
                  wd_mult_end: Optional[float] = 10.0,
-                 freeze_last_layer_epochs: int = 1):
+                 freeze_last_layer_epochs: int = 1,
+                 bidirectional: bool = False,
+                 unimodal_to_joint: bool = True):
         """
         Args:
             encoder: multimodal fusion encoder (the online / student network).
@@ -62,6 +66,11 @@ class MMSD(BaseModel):
                 specifies a constant decay, so it keeps `optim_kwargs`'s value.
             freeze_last_layer_epochs: epochs during which the DINO prototype layer
                 receives no gradient. Ignored by the other objectives.
+            bidirectional: the teacher encodes every mask, not only the joint one, and
+                the joint student also predicts each unimodal teacher output.
+            unimodal_to_joint: keep the unimodal student's predictions of the joint
+                teacher. False needs `bidirectional`, which then leaves the joint
+                student's predictions (of each unimodal and of the joint teacher) only.
         """
         super(MMSD, self).__init__(optim_kwargs)
 
@@ -70,7 +79,12 @@ class MMSD(BaseModel):
 
         loss_kwargs = dict(loss_kwargs)
         self.objective = loss_kwargs.get("objective", "byol")
-        self.loss = MMSelfDistillLoss(**loss_kwargs)
+        self.bidirectional = bool(bidirectional)
+        self.unimodal_to_joint = bool(unimodal_to_joint)
+        if not (self.bidirectional or self.unimodal_to_joint):
+            raise ValueError("unimodal_to_joint=False needs bidirectional=True: no unimodal pair would remain")
+        n_centers = encoder.num_modalities + 1 if self.bidirectional else 1
+        self.loss = MMSelfDistillLoss(**loss_kwargs, n_centers=n_centers)
 
         dim = self._head_out_dim(projection)
         pk = dict(predictor_kwargs or {})
@@ -219,11 +233,16 @@ class MMSD(BaseModel):
         teacher = []
         with torch.no_grad():
             for x in (x1, x2):
-                z = self.teacher_encoder(x, mask_modalities=joint)
-                teacher.append(self.teacher_head(z[0]).detach())
+                if self.bidirectional:
+                    z = self.teacher_encoder(x, mask_modalities=masks)
+                    teacher.append([self.teacher_head(zi).detach() for zi in z])
+                else:
+                    z = self.teacher_encoder(x, mask_modalities=joint)
+                    teacher.append(self.teacher_head(z[0]).detach())
 
-        return {"student": student, "teacher": teacher,
-                "cross_view": self.cross_view, "prototype": -1}
+        return {"student": student, "teacher": teacher, "cross_view": self.cross_view,
+                "bidirectional": self.bidirectional, "unimodal_to_joint": self.unimodal_to_joint,
+                "prototype": -1}
 
     # ---- probing ---------------------------------------------------------
     # Which network each original method evaluates, and why they differ: the probed
